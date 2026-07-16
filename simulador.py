@@ -1,65 +1,96 @@
 import numpy as np
-import plotly.graph_objects as go
-import streamlit as st # NUEVO MOTOR WEB
+import pyvista as pv
 
 # ==========================================
-# 0. CONFIGURACIÓN DE LA PÁGINA
+# 1. CREAR EL ESPACIO DE TRABAJO (Malla 3D)
 # ==========================================
-st.set_page_config(page_title="Simulador EM", layout="wide")
-st.title("⚡ Simulador de Campos Electromagnéticos 3D")
+# Creamos 108,000 puntos de cálculo (Tu GPU lo hará sin sudar)
+x = np.linspace(-3, 3, 60)
+y = np.linspace(-3, 3, 60)
+z = np.linspace(-1.5, 1.5, 30)
+grid = pv.RectilinearGrid(x, y, z)
 
-# Creamos un panel lateral para los controles
-st.sidebar.header("Panel de Control")
-# Un deslizador para mover la carga positiva en el eje X (de -2 a 2)
-posicion_x_positiva = st.sidebar.slider("Posición Carga Positiva (X)", -2.0, 2.0, -1.0)
-posicion_x_negativa = st.sidebar.slider("Posición Carga Negativa (X)", -2.0, 2.0, 1.0)
-
-# ==========================================
-# 1. EL MOTOR FÍSICO (Exactamente igual que antes)
-# ==========================================
-def calcular_campo_3d(q, pos_q, X, Y, Z):
-    ke = 8.99e9 
-    rx, ry, rz = X - pos_q[0], Y - pos_q[1], Z - pos_q[2]
-    r = np.sqrt(rx**2 + ry**2 + rz**2)
-    r[r == 0] = 1e-9 
-    return ke*q*rx/r**3, ke*q*ry/r**3, ke*q*rz/r**3
-
-x, y, z = np.linspace(-3, 3, 20), np.linspace(-3, 3, 20), np.linspace(-3, 3, 20)
-X, Y, Z = np.meshgrid(x, y, z)
-
-# ATENCIÓN AQUÍ: Usamos las variables del slider en lugar de números fijos
-E1x, E1y, E1z = calcular_campo_3d(1e-9, [posicion_x_positiva, 0, 0], X, Y, Z)
-E2x, E2y, E2z = calcular_campo_3d(-1e-9, [posicion_x_negativa, 0, 0], X, Y, Z)
-
-Ex, Ey, Ez = E1x + E2x, E1y + E2y, E1z + E2z
+# Extraemos las coordenadas matemáticas de cada punto
+pts = grid.points
+X, Y, Z = pts[:, 0], pts[:, 1], pts[:, 2]
 
 # ==========================================
-# 2. EL MOTOR GRÁFICO (Casi igual que antes)
+# 2. DEFINIR EL NÚCLEO EN "C" (Geometría)
 # ==========================================
-E_magnitud = np.sqrt(Ex**2 + Ey**2 + Ez**2) + 1e-15
-E_log = np.log10(E_magnitud + 1)
+R = np.sqrt(X**2 + Y**2)
+R_centro = 2.0 # El centro de la pista magnética
 
-Ex_plot = (Ex / E_magnitud) * E_log
-Ey_plot = (Ey / E_magnitud) * E_log
-Ez_plot = (Ez / E_magnitud) * E_log
+# Lógica Booleana: ¿Qué puntos forman el núcleo?
+# 1. Es un anillo con radio entre 1.5 y 2.5, y altura Z entre -0.5 y 0.5
+en_anillo = (R > 1.5) & (R < 2.5) & (np.abs(Z) < 0.5)
 
-fig = go.Figure(data=go.Cone(
-    x=X.flatten(), y=Y.flatten(), z=Z.flatten(),
-    u=Ex_plot.flatten(), v=Ey_plot.flatten(), w=Ez_plot.flatten(),
-    colorscale='Plasma'
-))
+# 2. El entrehierro (Air Gap) está en la parte derecha (X>0) y es un corte estrecho (Y entre -0.2 y 0.2)
+en_gap = (X > 0) & (np.abs(Y) < 0.2)
 
-# Pintamos las cargas en su nueva posición dinámica
-fig.add_trace(go.Scatter3d(
-    x=[posicion_x_positiva, posicion_x_negativa], y=[0, 0], z=[0, 0],
-    mode='markers+text', marker=dict(size=12, color=['red', 'blue']),
-    text=['+q', '-q'], textposition="top center"
-))
+# 3. El núcleo de ferrita es el anillo MENOS la zona del entrehierro
+es_nucleo = en_anillo & ~en_gap
 
-fig.update_layout(scene=dict(aspectmode="data"), height=700)
+# Guardamos esta información en la malla y extraemos el modelo 3D del núcleo
+grid["material"] = es_nucleo.astype(float)
+nucleo_mesh = grid.threshold(0.5, scalars="material")
 
 # ==========================================
-# 3. MOSTRAR EN LA WEB (La magia de Streamlit)
+# 3. FÍSICA: CAMPO MAGNÉTICO Y DISPERSIÓN (Fringing)
 # ==========================================
-# En lugar de guardar un HTML, le decimos a Streamlit que pinte la figura
-st.plotly_chart(fig, use_container_width=True)
+R_safe = np.where(R == 0, 1e-9, R)
+
+# A. Campo Base: El flujo da vueltas en círculo (Vector tangente)
+Bx = -Y / R_safe
+By = X / R_safe
+Bz = np.zeros_like(Z)
+
+# B. Modelo matemático del Fringing Effect
+# Usamos una campana de Gauss centrada en el entrehierro para saber cuándo empujar el campo
+intensidad_dispersion = np.exp(-(Y**2) / 0.05) * (X > 0)
+
+# Cuando nos acercamos al aire, los vectores sufren una expansión (divergencia)
+# Empuje radial (se salen por los lados del núcleo)
+Bx += intensidad_dispersion * (R - R_centro) * (X / R_safe) * 1.5
+# Empuje axial (se salen por arriba y por abajo del núcleo)
+Bz += intensidad_dispersion * Z * 1.5
+
+# Guardamos el campo vectorial total en nuestro universo PyVista
+grid["B_field"] = np.column_stack((Bx, By, Bz))
+
+# ==========================================
+# 4. GENERAR LOS TUBOS DE FLUJO (Streamlines)
+# ==========================================
+# Plantamos una "rejilla de semillas" cuadrada en la parte izquierda del núcleo.
+# Desde aquí nacerán las líneas de flujo y viajarán por la física que hemos programado.
+semillas = pv.Plane(
+    center=(-2, 0, 0), direction=(0, 1, 0), 
+    i_size=0.8, j_size=0.8, 
+    i_resolution=7, j_resolution=7
+)
+
+# El motor C++ calcula el recorrido exacto de los campos
+flujo = grid.streamlines_from_source(
+    semillas,
+    vectors="B_field",
+    integration_direction="both", # Que fluya hacia adelante y hacia atrás
+    max_steps=2000
+)
+
+# ==========================================
+# 5. RENDERIZADO PROFESIONAL
+# ==========================================
+plotter = pv.Plotter()
+plotter.background_color = "black"
+
+# 1. Dibujamos los tubos de flujo electromagnético con textura térmica
+plotter.add_mesh(flujo.tube(radius=0.015), cmap="plasma", show_scalar_bar=False)
+
+# 2. Dibujamos el núcleo metálico semitransparente para ver el interior
+plotter.add_mesh(nucleo_mesh, color="silver", opacity=0.25)
+
+# Añadimos bordes y títulos
+plotter.add_bounding_box(color="gray")
+plotter.add_text("Efecto de Dispersión en Entrehierro (Fringing Effect)", font_size=12, color="white")
+
+# ¡A renderizar en la GPU!
+plotter.show()
